@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import json
+import traceback
 from pathlib import Path
 import tempfile
 import select
@@ -99,7 +100,9 @@ def initRender(out, sframe, eframe, userange, useskip, step=1):
 
     parm_skip = rnode.parm("RS_outputSkipRendered")
     if parm_skip is not None:
-        if useskip:
+        # Convert useskip string to boolean
+        skip_enabled = useskip.lower() == "true"
+        if skip_enabled:
             parm_skip.set(1)
         else:
             parm_skip.set(0)
@@ -111,13 +114,13 @@ def initRender(out, sframe, eframe, userange, useskip, step=1):
                   "Defaulting to the frame range that was set from within Houdini for each ROP.")
     else:
         if userange == "True":
-            # Set the frame range parameters
-            rnode.parm("f1").set(int(sframe))
-            rnode.parm("f2").set(int(eframe))
-            rnode.parm("f3").set(int(step))  # Set frame step
-
             # Create a list of frames to render based on step
             frames = list(range(int(sframe), int(eframe) + 1, int(step)))
+
+            # Set the frame range parameters to match our actual frame list
+            rnode.parm("f1").set(frames[0])  # First frame in our list
+            rnode.parm("f2").set(frames[-1])  # Last frame in our list
+            rnode.parm("f3").set(int(step))  # Set frame step
 
             # Render each frame individually to ensure proper stepping
             for frame in frames:
@@ -291,11 +294,255 @@ class HipFilesLoader(QThread):
         hip_files = refresh_hip_files()
         self.finished.emit(hip_files)
 
+class FrameProgressWidget(QWidget):
+    """Custom widget to display frame progress with variable-height bars"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(50)  # Set minimum height for the bar graph
+        self.setMinimumWidth(100)
+
+        # Frame data
+        self.frame_times = {}  # Dictionary mapping frame numbers to render times
+        self.total_frames = 0
+        self.current_frame = None  # Changed to None to indicate no current frame
+        self.current_frame_progress = 0  # 0-100%
+        self.max_time = 1.0  # To normalize bar heights
+        self.placeholder_height = 5  # Height of placeholder bars
+        self.estimated_current_frame_time = 0.0  # Estimated time for current frame
+        self.frame_range = None  # Store the frame range when using step frames
+        self.frame_to_index = {}  # Mapping from frame numbers to widget positions
+        self.index_to_frame = {}  # Reverse mapping from widget positions to frame numbers
+
+        # Colors
+        self.completed_color = QColor("#22adf2")  # Blue for completed frames
+        self.current_color = QColor("#ff4c00")    # Orange for current frame
+        self.placeholder_color = QColor("#444444")  # Dark gray for placeholder
+        self.skipped_color = QColor("#666666")    # Lighter gray for skipped frames
+
+        # Set background color
+        self.setStyleSheet("background-color: #222222; border: 1px solid #555555; border-radius: 3px;")
+
+        # Enable tooltip
+        self.setMouseTracking(True)
+
+        # Current position for tooltips
+        self.hover_position = -1
+
+    def event(self, event):
+        """Custom event handler for tooltips"""
+        if event.type() == QEvent.Type.ToolTip:
+            # Get mouse position
+            pos = event.pos()
+            frame_info = self.get_frame_info_at_position(pos)
+
+            if frame_info:
+                QToolTip.showText(event.globalPos(), frame_info)
+            else:
+                QToolTip.hideText()
+                event.ignore()
+
+            return True
+
+        return super().event(event)
+
+    def get_frame_info_at_position(self, pos):
+        """Get frame information at the given position"""
+        if self.total_frames <= 0:
+            return "No frames to display"
+
+        # Calculate which frame bar is under the cursor
+        bar_width = self.width() / self.total_frames
+        widget_pos = int(pos.x() / bar_width)
+
+        if widget_pos < 0 or widget_pos >= self.total_frames:
+            return None
+
+        # Get actual frame number if we have frame_range mapping
+        if self.frame_range and widget_pos in self.index_to_frame:
+            frame_number = self.index_to_frame[widget_pos]
+        else:
+            # If no frame range mapping, adjust for 1-based frame numbers
+            frame_number = widget_pos + 1
+
+        # Create tooltip based on frame status
+        if widget_pos == self.current_frame:
+            # Current frame in progress
+            tooltip = f"Frame {frame_number} - In progress\n"
+            tooltip += f"Progress: {self.current_frame_progress}%"
+            if self.estimated_current_frame_time > 0:
+                tooltip += f"\nEstimated time: {self.format_time(self.estimated_current_frame_time)}"
+            return tooltip
+
+        elif widget_pos in self.frame_times:
+            # Completed or skipped frame
+            time = self.frame_times[widget_pos]
+            if time > 0:
+                # Completed frame
+                return f"Frame {frame_number}\nRender time: {self.format_time(time)}"
+            else:
+                # Skipped frame
+                return f"Frame {frame_number} - Skipped\nFile already exists"
+        else:
+            # Not yet rendered
+            return f"Frame {frame_number} - Pending"
+
+    def set_total_frames(self, total, frame_range=None):
+        """Set the total number of frames and optionally the frame range"""
+        self.total_frames = total
+        if frame_range:
+            self.frame_range = frame_range
+            # Create bidirectional mappings
+            self.frame_to_index = {frame: i for i, frame in enumerate(frame_range)}
+            self.index_to_frame = {i: frame for i, frame in enumerate(frame_range)}
+        else:
+            self.frame_range = None
+            self.frame_to_index = {}
+            self.index_to_frame = {}
+        self.update()
+
+    def update_frame_progress(self, frame, progress, estimated_time=None):
+        """Update the progress of the current frame (0-100%)"""
+        # Store the frame number directly
+        self.current_frame = frame
+        self.current_frame_progress = progress
+
+        # If progress is 100%, move this frame to completed frames
+        if progress >= 100:
+            if estimated_time is not None:
+                self.frame_times[frame] = estimated_time
+            self.current_frame = None  # Clear current frame
+            self.current_frame_progress = 0
+
+        # If we have an estimated time, update it
+        elif estimated_time is not None:
+            self.estimated_current_frame_time = estimated_time
+            if estimated_time > self.max_time:
+                self.max_time = estimated_time
+
+        self.update()
+
+    def add_frame_time(self, frame, time):
+        """Add a completed frame and its render time"""
+        self.frame_times[frame] = time
+        self.max_time = max(self.max_time, time)  # Update max time for scaling
+        # Clear current frame if this was the current frame
+        if frame == self.current_frame:
+            self.current_frame = None
+            self.current_frame_progress = 0
+        self.update()
+
+    def set_frame_skipped(self, frame):
+        """Mark a frame as skipped (will use a placeholder bar)"""
+        self.frame_times[frame] = 0  # Skipped frames get 0 time
+        # Clear current frame if this was the current frame
+        if frame == self.current_frame:
+            self.current_frame = None
+            self.current_frame_progress = 0
+        self.update()
+
+    def clear(self):
+        """Clear all frame data"""
+        self.frame_times.clear()
+        self.current_frame = None  # Changed to None
+        self.current_frame_progress = 0
+        self.max_time = 1.0
+        self.estimated_current_frame_time = 0.0
+        self.frame_range = None
+        self.frame_to_index = {}
+        self.index_to_frame = {}
+        self.update()
+
+    def paintEvent(self, event):
+        """Paint the frame progress bars"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Draw background
+        painter.fillRect(self.rect(), QColor("#222222"))
+
+        if self.total_frames <= 0:
+            return
+
+        # Calculate bar width
+        bar_width = self.width() / self.total_frames
+        # Ensure there's a minimum width
+        bar_width = max(3, bar_width)
+        # Allow for tiny 1px spacing between bars if they're wide enough
+        spacing = 1 if bar_width >= 5 else 0
+
+        # Use full height for bars since we removed the text
+        available_height = self.height()
+
+        # Draw frame bars
+        for widget_pos in range(self.total_frames):
+            x = widget_pos * bar_width
+
+            # Skip this frame position if it would be too small to see
+            if x + bar_width <= 0 or x >= self.width():
+                continue
+
+            if widget_pos == self.current_frame:
+                # Current frame gets an orange bar that grows with progress
+                # If we have an estimated time, use that to determine the height
+                if self.estimated_current_frame_time > 0:
+                    # Calculate estimated height based on progress and estimated time
+                    estimated_height = min((self.estimated_current_frame_time / self.max_time) * available_height, available_height)
+                    # Scale the estimated height by the current progress, but start from placeholder height
+                    progress_ratio = self.current_frame_progress / 100.0
+                    height = self.placeholder_height + (progress_ratio * (estimated_height - self.placeholder_height))
+                else:
+                    # If no estimated time, fall back to progress-based height starting from placeholder
+                    progress_ratio = self.current_frame_progress / 100.0
+                    height = self.placeholder_height + (progress_ratio * (available_height - self.placeholder_height))
+
+                painter.fillRect(
+                    QRectF(x, self.height() - height, bar_width - spacing, height),
+                    self.current_color
+                )
+            elif widget_pos in self.frame_times:
+                time = self.frame_times[widget_pos]
+                if time > 0:
+                    # Completed frame - blue bar with height based on render time
+                    height = min((time / self.max_time) * available_height, available_height)
+                    painter.fillRect(
+                        QRectF(x, self.height() - height, bar_width - spacing, height),
+                        self.completed_color
+                    )
+                else:
+                    # Skipped frame - small placeholder bar with lighter color
+                    painter.fillRect(
+                        QRectF(x, self.height() - self.placeholder_height, bar_width - spacing, self.placeholder_height),
+                        self.skipped_color
+                    )
+            else:
+                # Not yet rendered - tiny placeholder bar
+                painter.fillRect(
+                    QRectF(x, self.height() - self.placeholder_height, bar_width - spacing, self.placeholder_height),
+                    self.placeholder_color
+                )
+
+    def format_time(self, seconds):
+        """Format time in seconds to human readable string"""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            seconds = seconds % 60
+            return f"{minutes}m {seconds:.1f}s"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            seconds = seconds % 60
+            return f"{hours}h {minutes}m {seconds:.1f}s"
+
 class HoudiniRenderGUI(QMainWindow):
     # Define signals for thread-safe UI updates
     output_signal = Signal(str)
     raw_output_signal = Signal(str)
     progress_signal = Signal(int, int)
+    frame_progress_signal = Signal(int, int)  # New signal for per-frame progress
+    frame_completed_signal = Signal(int, float)  # New signal for completed frames
+    frame_skipped_signal = Signal(int)  # New signal for skipped frames
     image_update_signal = Signal(str)
     render_finished_signal = Signal()
     time_labels_signal = Signal(float, float, float, float, QDateTime, bool)
@@ -303,6 +550,20 @@ class HoudiniRenderGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
+
+        # Add text update queues and locks
+        self.summary_update_queue = []
+        self.raw_update_queue = []
+        self.summary_update_lock = threading.Lock()
+        self.raw_update_lock = threading.Lock()
+
+        # Create timers for processing updates
+        self.summary_update_timer = QTimer()
+        self.raw_update_timer = QTimer()
+        self.summary_update_timer.timeout.connect(self.process_summary_updates)
+        self.raw_update_timer.timeout.connect(self.process_raw_updates)
+        self.summary_update_timer.start(50)  # Process updates every 50ms
+        self.raw_update_timer.start(50)
 
         # Set initial window size
         self.resize(1200, 800)  # Set default window size to 1200x800
@@ -738,6 +999,7 @@ class HoudiniRenderGUI(QMainWindow):
                 color: #cccccc;
                 border: none;
                 padding: 10px;
+                font-family: "Courier New", monospace;
             }
             QScrollBar:vertical {
                 width: 8px;
@@ -816,31 +1078,8 @@ class HoudiniRenderGUI(QMainWindow):
         # Add splitter to main layout and make it expand
         self.layout.addWidget(self.text_splitter, 1)  # Add stretch factor
 
-        self.progress_frame = QProgressBar()
-        self.progress_frame.setOrientation(Qt.Orientation.Horizontal)
-        self.progress_frame.setRange(0, 100)
-        self.progress_frame.setValue(0)
-        self.progress_frame.setStyleSheet("background-color: #222222; border: 1px solid #555555; text-align: center;")
+        self.progress_frame = FrameProgressWidget()
         self.layout.addWidget(self.progress_frame)
-
-        # Add per-frame progress bar
-        self.frame_progress = QProgressBar()
-        self.frame_progress.setOrientation(Qt.Orientation.Horizontal)
-        self.frame_progress.setRange(0, 100)
-        self.frame_progress.setValue(0)
-        self.frame_progress.setFormat('Current Frame Progress: %p%')
-        self.frame_progress.setStyleSheet("""
-            QProgressBar {
-                background-color: #222222;
-                border: 1px solid #ff4c00;
-                text-align: center;
-                margin-bottom: 6px;
-            }
-            QProgressBar::chunk {
-                background-color: #ff4c00;
-            }
-        """)
-        self.layout.addWidget(self.frame_progress)
 
         # For robust per-frame progress tracking
         self.completed_blocks = set()
@@ -1421,6 +1660,9 @@ class HoudiniRenderGUI(QMainWindow):
         self.canceling = False
         self.render_start_time = datetime.datetime.now()  # Store render start time
 
+        # Disable open folder button until we have an output
+        self.open_folder_btn.setEnabled(False)
+
         # Clear previous image previews
         for label, name_label in self.image_widgets:
             label.clear()
@@ -1567,14 +1809,24 @@ class HoudiniRenderGUI(QMainWindow):
             start_time = datetime.datetime.now()
             current_frame_start = None
             current_frame = 0
+            current_frame_number = None
             notify_interval = int(self.notify_frames.text() or "10")
+
+            # Track whether we've already displayed scene info
+            scene_info_displayed = False
 
             # Calculate total frames based on range and step
             if self.range_check.isChecked():
                 start = int(self.start_frame.text())
                 end = int(self.end_frame.text())
                 step = int(self.frame_step.currentText())
-                total_frames = len(range(start, end + 1, step))
+                frame_range = list(range(start, end + 1, step))
+                total_frames = len(frame_range)
+                # Pass frame range to progress widget
+                self.progress_frame.set_total_frames(total_frames, frame_range)
+                # Create frame mappings for easy lookup
+                frame_to_index = {frame: i for i, frame in enumerate(frame_range)}
+                index_to_frame = {i: frame for i, frame in enumerate(frame_range)}
             else:
                 # Get from ROP settings if available
                 out_node = self.out_input.currentText()
@@ -1583,37 +1835,36 @@ class HoudiniRenderGUI(QMainWindow):
                     total_frames = settings['f2'] - settings['f1'] + 1
                 else:
                     total_frames = 1
+                self.progress_frame.set_total_frames(total_frames)
+                frame_to_index = {}
+                index_to_frame = {}
 
             # Update initial frame count display
             self.fc_value.setText("0")
             self.tfc_value.setText(str(total_frames))
             self.progress_signal.emit(0, total_frames)
+            self.progress_frame.clear()
 
-            # Send initial notification
-            if self.notify_check.isChecked():
-                job_name = os.path.splitext(os.path.basename(self.hip_input.currentText()))[0]
-                start_message = f"🎬 Starting render: {job_name}\nFrames: {total_frames}"
-                self.send_push_notification(start_message)
-
-            # At the start of monitor_render, before the while loop
+            # Track frames we've seen and skipped
             frames_seen = set()
-            current_frame_number = None
+            skipped_frames = set()
+            consecutive_skips = []
+            last_message_type = None
+
+            # Dictionary to track frame render start times
+            frame_start_times = {}
 
             while self.process and self.process.poll() is None:
                 # Add timeout to readline to allow checking cancellation
                 ready = select.select([self.process.stdout], [], [], 0.1)[0]
                 if not ready:
-                    # No output available, check if we're canceling
                     if self.canceling and not current_frame_in_progress:
-                        # If we're not in the middle of a frame, we can stop immediately
                         break
                     elif self.canceling and not graceful_shutdown_requested:
-                        # If we're in the middle of a frame and haven't sent the signal yet
                         try:
                             os.kill(self.process.pid, signal.SIGUSR1)
                             graceful_shutdown_requested = True
                         except AttributeError:
-                            # If SIGUSR1 is not available, wait for frame to complete
                             pass
                     continue
 
@@ -1627,203 +1878,170 @@ class HoudiniRenderGUI(QMainWindow):
                 # Update raw output
                 self.raw_output_signal.emit(line)
 
-                # Check for frame start
-                if 'Rendering frame' in line:
-                    current_frame_in_progress = True
-                    frame_match = re.search(r'frame (\d+)', line)
-                    if frame_match:
-                        current_frame = int(frame_match.group(1))
+                # Check for saved file messages - handle both single and double quotes
+                saved_file_match = re.search(r"Saved file ['\"]([^'\"]+\.(?:exr|png|jpg|jpeg|tif|tiff))['\"]", line)
+                if saved_file_match:
+                    output_file = saved_file_match.group(1)
+                    print(f"Detected saved file: {output_file}")
+                    # Store the output path for "Open Output Location" button
+                    self.renderedImage = output_file
+                    # Trigger image preview update
+                    self.image_update_signal.emit(output_file)
+
+                # ===== FRAME DETECTION AND SKIPPING LOGIC =====
+
+                # Track when a frame is about to be rendered
+                frame_rendering_match = re.search(r"'([^']+)' rendering frame (\d+)", line)
+                if frame_rendering_match:
+                    current_frame_number = int(frame_rendering_match.group(2))
+                    # Store the start time for this frame
+                    frame_start_times[current_frame_number] = datetime.datetime.now()
+                    # We now have a current frame number but don't know yet if it will be skipped
+
+                # Check if the frame is being skipped
+                if 'Skip rendering enabled. File already rendered' in line or 'Skipped - File already exists' in line:
+                    if current_frame_number is not None:
+                        # Process frame as skipped
+                        if self.range_check.isChecked():
+                            if current_frame_number in frame_to_index:
+                                skipped_frames.add(current_frame_number)
+                                frames_seen.add(current_frame_number)
+                                frame_count = len([f for f in frames_seen if f in frame_to_index])
+                                # Set skipped using frame index
+                                self.progress_frame.set_frame_skipped(frame_to_index[current_frame_number])
+                                consecutive_skips.append(current_frame_number)
+                        else:
+                            skipped_frames.add(current_frame_number)
+                            frames_seen.add(current_frame_number)
+                            frame_count = len(frames_seen)
+                            # Set skipped using frame count
+                            self.progress_frame.set_frame_skipped(frame_count - 1)
+                            consecutive_skips.append(current_frame_number)
+
+                        # Update UI with skipped frame
+                        self.fc_value.setText(str(frame_count))
+                        self.progress_signal.emit(frame_count, total_frames)
+                        last_message_type = "skipped"
+                        # Mark that we're not rendering this frame
+                        current_frame_in_progress = False
+                        # Clear current frame number to prevent output
+                        current_frame_number = None
+
+                # For non-skipped frames, we need to detect when they start actual rendering
+                elif 'Loading RS rendering options' in line and current_frame_number is not None:
+                    # Only process if we haven't seen this frame in skipped_frames
+                    if current_frame_number not in skipped_frames:
+                        current_frame_in_progress = True
+
+                        # Get time estimates
+                        start_time = frame_start_times[current_frame_number]
+                        estimated_time = 0
+                        if frame_times:
+                            if len(frame_times) >= 2:
+                                estimated_time = recent_average
+                            else:
+                                estimated_time = average
+
+                        # Only output frame header if this isn't part of a consecutive skip sequence
+                        if not consecutive_skips:
+                            # Format the frame header with estimated time using fixed-width fields
+                            frame_header = f"\n Frame {current_frame_number}\n"
+                            frame_header += f"   {'Started':<8} {start_time.strftime('%I:%M:%S %p')}\n"
+                            if estimated_time > 0:
+                                est_finish_time = start_time + datetime.timedelta(seconds=estimated_time)
+                                frame_header += f"   {'Estimate':<8} {est_finish_time.strftime('%I:%M:%S %p')} - {self.format_time(estimated_time)}\n"
+                            self.output_signal.emit(frame_header)
+
                         # Calculate frame count based on step
                         if self.range_check.isChecked():
-                            start = int(self.start_frame.text())
-                            step = int(self.frame_step.currentText())
-                            frame_count = len(range(start, current_frame + 1, step))
+                            # Only count frames that are in our range
+                            if current_frame_number in frame_to_index:
+                                frame_count = frame_to_index[current_frame_number] + 1
+                                # Update progress using frame index
+                                self.progress_frame.update_frame_progress(frame_to_index[current_frame_number], 0)
                         else:
                             frame_count += 1
+                            # Update progress using actual frame number
+                            self.progress_frame.update_frame_progress(frame_count - 1, 0)
 
                         # Update UI
                         self.fc_value.setText(str(frame_count))
                         self.progress_signal.emit(frame_count, total_frames)
 
-                    # Reset per-frame progress bar at the start of each frame
-                    self.frame_progress.setValue(0)
-                    current_frame_start = datetime.datetime.now()
+                        current_frame_start = datetime.datetime.now()
 
                 # Check for frame completion
-                elif 'Frame completed' in line or 'Skip rendering enabled' in line:
+                elif 'ROP node endRender' in line:
                     current_frame_in_progress = False
                     if self.canceling and graceful_shutdown_requested:
-                        # If we were waiting for the frame to complete, now we can stop
-                        # Reset the button state before breaking
                         self.render_finished_signal.emit()
                         break
 
-                # Check for frame number in render start message
-                frame_start_match = re.search(r'Rendering frame (\d+)', line)
-                if frame_start_match:
-                    current_frame_number = int(frame_start_match.group(1))
-                    # Add all frames up to this one to account for skips
-                    for frame in range(1, current_frame_number + 1):
-                        if frame not in frames_seen:
-                            frames_seen.add(frame)
-                    frame_count = len(frames_seen)
-                    self.fc_value.setText(str(frame_count))
-                    self.progress_signal.emit(frame_count, total_frames)
+                # Check for Redshift block progress
+                block_match = re.search(r'Block (\d+)/(\d+)', line)
+                if block_match and current_frame_number is not None:
+                    block_num = int(block_match.group(1))
+                    total_blocks = int(block_match.group(2))
+                    if self.total_blocks is None or self.total_blocks != total_blocks:
+                        self.total_blocks = total_blocks
+                    self.completed_blocks.add(block_num)
+                    percent = int((len(self.completed_blocks) / self.total_blocks) * 100)
 
-                    # Reset per-frame progress bar at the start of each frame (as soon as frame starts)
-                    self.frame_progress.setValue(0)
-
-                    # Calculate times and send notification if needed
-                    current_time = datetime.datetime.now()
-                    elapsed_time = (current_time - start_time).total_seconds()
+                    # Get the estimated time for this frame
+                    estimated_time = 0
                     if frame_times:
-                        average = sum(frame_times) / len(frame_times)
-                        remaining_frames = max(0, total_frames - frame_count)
-                        remaining_time = remaining_frames * average
-                        est_total = total_frames * average
-                        eta_dt = current_time + datetime.timedelta(seconds=remaining_time)
-                    else:
-                        average = elapsed_time / max(frame_count, 1)
-                        remaining_frames = max(0, total_frames - frame_count)
-                        remaining_time = remaining_frames * average
-                        est_total = total_frames * average
-                        eta_dt = current_time + datetime.timedelta(seconds=remaining_time)
-
-                    # Send notification if needed
-                    if self.notify_check.isChecked():
-                        # Dynamically read the notification interval from the UI
-                        try:
-                            current_notify_interval = int(self.notify_frames.text() or "10")
-                        except ValueError:
-                            current_notify_interval = 10
-
-                        if (frame_count % current_notify_interval == 0 and
-                            frame_count != last_notified_frame):
-
-                            last_notified_frame = frame_count
-                            job_name = os.path.splitext(os.path.basename(self.hip_input.currentText()))[0]
-
-                            message = (
-                                f"🎨 {job_name}\n"
-                                f"Frame: {frame_count}/{total_frames}\n"
-                                f"Elapsed: {format_time(elapsed_time)}\n"
-                                f"Avg Frame: {format_time(average)}\n"
-                                f"Remaining: {format_time(remaining_time)}\n"
-                                f"Est. Total: {format_time(est_total)}\n"
-                                f"ETA: {eta_dt.strftime('%I:%M:%S %p')}"
-                            )
-
-                            # Convert EXR to PNG for notification
-                            if self.renderedImage and self.renderedImage.lower().endswith('.exr'):
-                                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                                    buf = oiio.ImageBuf(self.renderedImage)
-                                    display_buf = oiio.ImageBufAlgo.colorconvert(buf, "linear", "srgb")
-                                    display_buf.write(tmp.name)
-                                    self.send_push_notification(message, tmp.name)
-                                    os.unlink(tmp.name)  # Clean up temp file
-                            else:
-                                self.send_push_notification(message)
-
-                # Check for skipped frames
-                if 'Skipped - File already exists' in line:
-                    # If we're at frame X, and we see a skip message, it means we're actually at frame X
-                    # So we need to count all frames up to the current one
-                    if current_frame_number is not None:
-                        # Add all frames from 1 to current_frame_number to frames_seen
-                        for frame in range(1, current_frame_number + 1):
-                            if frame not in frames_seen:
-                                frames_seen.add(frame)
-                        frame_count = len(frames_seen)
-                        self.fc_value.setText(str(frame_count))
-                        self.progress_signal.emit(frame_count, total_frames)
-
-                # Check for frame number in output
-                frame_match = re.search(r'Frame (\d+)\.\.\.', line)
-                if frame_match:
-                    current_frame_number = int(frame_match.group(1))
-                    # Add all frames up to this one to account for skips
-                    for frame in range(1, current_frame_number + 1):
-                        if frame not in frames_seen:
-                            frames_seen.add(frame)
-                    frame_count = len(frames_seen)
-                    self.fc_value.setText(str(frame_count))
-                    self.progress_signal.emit(frame_count, total_frames)
-
-                # Check for new rendered image
-                if 'hardeen_outputfile:' in line:
-                    self.renderedImage = line.split(': ')[1]
-                    self.image_update_signal.emit(self.renderedImage)
-
-                    # Extract frame number from filename
-                    frame_match = re.search(r'\.(\d+)\.', self.renderedImage)
-                    if frame_match:
-                        current_frame = int(frame_match.group(1))
-                        # Add all frames up to this one to account for skips
-                        for frame in range(1, current_frame + 1):
-                            if frame not in frames_seen:
-                                frames_seen.add(frame)
-                        frame_count = len(frames_seen)
-                        self.fc_value.setText(str(frame_count))
-                        self.progress_signal.emit(frame_count, total_frames)
-
-                elif 'render started for' in line:
-                    clean_line = line.split(' Time from')[0]
-                    self.output_signal.emit('\n' + clean_line + '\n')
-
-                elif 'Rendering frame' in line:
-                    # Extract current frame number
-                    frame_match = re.search(r'frame (\d+)', line)
-                    if frame_match:
-                        current_frame = int(frame_match.group(1))
-                        # Calculate frame count based on step
-                        if self.range_check.isChecked():
-                            start = int(self.start_frame.text())
-                            step = int(self.frame_step.currentText())
-                            frame_count = len(range(start, current_frame + 1, step))
+                        if len(frame_times) >= 2:
+                            estimated_time = recent_average
                         else:
-                            frame_count += 1
+                            estimated_time = average
 
-                        # Update UI
-                        self.fc_value.setText(str(frame_count))
-                        self.progress_signal.emit(frame_count, total_frames)
+                    # Update the current frame progress
+                    if self.range_check.isChecked():
+                        if current_frame_number in frame_to_index:
+                            # Update progress using frame index
+                            self.progress_frame.update_frame_progress(frame_to_index[current_frame_number], percent, estimated_time)
+                    else:
+                        # Update progress using frame count
+                        self.progress_frame.update_frame_progress(frame_count - 1, percent, estimated_time)
+                    continue
 
-                    # Reset per-frame progress bar at the start of each frame
-                    self.frame_progress.setValue(0)
-
-                    self.output_signal.emit(
-                        line.replace('Rendering f', 'F') + '\n'
-                    )
-                    current_frame_start = datetime.datetime.now()
-
-                    if average != 0:
-                        estimate = current_frame_start + datetime.timedelta(seconds=recent_average)
-                        self.output_signal.emit(
-                            f"   Started  {current_frame_start.strftime('%I:%M:%S %p')}\n"
-                            f"  Estimate  {estimate.strftime('%I:%M:%S %p')} - {format_time(recent_average)}\n"
-                        )
-
-                elif 'Skip rendering enabled. File already rendered' in line:
-                    # Handle skipped frames
-                    frame_count += 1
-                    self.fc_value.setText(str(frame_count))
-                    self.progress_signal.emit(frame_count, total_frames)
-                    self.output_signal.emit("   Skipped - File already exists\n")
-
+                # Check for frame completion (scene extraction time indicates completion)
                 elif 'scene extraction time' in line:
-                    if current_frame_start:
+                    if current_frame_start and current_frame_number is not None:
                         # Extract render time
                         match = re.search(r"total time (\d+\.\d+) sec", line)
                         if match:
                             render_time = float(match.group(1))
                             frame_times.append(render_time)
 
+                            # Add the frame time to our custom progress widget
+                            if self.range_check.isChecked():
+                                if current_frame_number in frame_to_index:
+                                    # Add frame time using frame index
+                                    self.progress_frame.add_frame_time(frame_to_index[current_frame_number], render_time)
+                            else:
+                                # Add frame time using frame count
+                                self.progress_frame.add_frame_time(frame_count - 1, render_time)
+
                             # Update progress
-                            frame_count += 1
+                            if self.range_check.isChecked():
+                                if current_frame_number in frame_to_index:
+                                    frame_count = frame_to_index[current_frame_number] + 1
+                            else:
+                                frame_count += 1
+
                             self.fc_value.setText(str(frame_count))
                             self.progress_signal.emit(frame_count, total_frames)
 
-                            # Set per-frame progress bar to 100% at end of frame
-                            self.frame_progress.setValue(100)
+                            # Set per-frame progress to 100% at end of frame
+                            if self.range_check.isChecked():
+                                if current_frame_number in frame_to_index:
+                                    # Update progress using frame index
+                                    self.progress_frame.update_frame_progress(frame_to_index[current_frame_number], 100)
+                            else:
+                                # Update progress using frame count
+                                self.progress_frame.update_frame_progress(frame_count - 1, 100)
+
                             # Optionally clear block tracking at end of frame
                             self.completed_blocks = set()
                             self.total_blocks = None
@@ -1857,23 +2075,38 @@ class HoudiniRenderGUI(QMainWindow):
                                 True                    # Show ETA
                             )
 
-                            # --- NEW: Output actual render time for this frame ---
-                            finished_str = f"   Finished  {current_time.strftime('%I:%M:%S %p')}  - {self.format_time(render_time)}\n"
-                            self.output_signal.emit(finished_str)
+                            # Output actual render time for this frame using fixed-width field
+                            if not consecutive_skips:
+                                finished_str = f"   {'Finished':<8} {current_time.strftime('%I:%M:%S %p')} - {self.format_time(render_time)}\n\n"
+                                self.output_signal.emit(finished_str)
 
-                # Check for Redshift block progress
-                block_match = re.search(r'Block (\d+)/(\d+)', line)
-                if block_match:
-                    block_num = int(block_match.group(1))
-                    total_blocks = int(block_match.group(2))
-                    # Initialize total_blocks if not set
-                    if self.total_blocks is None or self.total_blocks != total_blocks:
-                        self.total_blocks = total_blocks
-                    # Add this block to the set of completed blocks
-                    self.completed_blocks.add(block_num)
-                    percent = int((len(self.completed_blocks) / self.total_blocks) * 100)
-                    self.frame_progress.setValue(percent)
-                    continue
+                            last_message_type = "completed"
+
+            # Output any remaining skipped frames at the end
+            if consecutive_skips:
+                consecutive_skips.sort()
+                ranges = []
+                start = end = consecutive_skips[0]
+
+                for i in range(1, len(consecutive_skips)):
+                    if consecutive_skips[i] == end + 1:
+                        end = consecutive_skips[i]
+                    else:
+                        if start == end:
+                            ranges.append(f"{start}")
+                        else:
+                            ranges.append(f"{start}-{end}")
+                        start = end = consecutive_skips[i]
+
+                if start == end:
+                    ranges.append(f"{start}")
+                else:
+                    ranges.append(f"{start}-{end}")
+
+                frames_text = ", ".join(ranges)
+                self.output_signal.emit(f"Frames {frames_text} skipped - Files already exist\n\n")
+                consecutive_skips.clear()
+                last_message_type = "skipped"
 
             # Only send completion notification if not cancelled
             if self.notify_check.isChecked() and not self.canceling:
@@ -1898,42 +2131,68 @@ class HoudiniRenderGUI(QMainWindow):
 
     def render_finished(self):
         """Handle render completion (called in main thread)"""
+        # Stop text update timers before final updates
+        self.summary_update_timer.stop()
+        self.raw_update_timer.stop()
+
+        # Process any remaining text updates
+        self.process_summary_updates()
+        self.process_raw_updates()
+
+        # Calculate final elapsed time
+        elapsed = (datetime.datetime.now() - self.render_start_time).total_seconds()
+
         if self.canceling:
             # If we were canceling, show interrupted message
             if self.cancel_btn.text() == 'Kill':
                 self.append_output_safe(
-                    '\n Render killed and stopped. \n\n',
+                    '\n\n Render killed and stopped. \n\n',
                     color='#ff7a7a',
                     bold=True,
                     center=True
                 )
             else:
                 self.append_output_safe(
-                    '\n Render interrupted and stopped. \n\n',
+                    '\n\n Render gracefully canceled. \n\n',
                     color='#ff7a7a',
                     bold=True,
                     center=True
                 )
         else:
+            # Show completion message
             self.append_output_safe(
-                '\n Render completed successfully. \n\n',
-                color='#22adf2',  # Using the same blue as render start
+                '\n\n RENDER COMPLETED \n\n',
+                color='#22adf2',
                 bold=True,
                 center=True
             )
 
-        # Reset button states and flags
+            # Schedule shutdown if enabled
+            if self.shutdown_check.isChecked():
+                delay = self.get_shutdown_delay_seconds()
+                self.schedule_shutdown(delay)
+
+        # Reset UI state
         self.render_btn.show()
         self.cancel_btn.hide()
-        self.cancel_btn.setText('Interrupt')
-        self.canceling = False  # Reset canceling state
+        self.canceling = False
+
+        # Reset time labels with final elapsed time
+        self.time_labels_signal.emit(
+            elapsed,  # Total elapsed time
+            0,       # Average (reset to 0)
+            elapsed, # Est. Total (same as elapsed since we're done)
+            0,      # Remaining time (0 since we're done)
+            QDateTime(),  # Empty ETA since we're done
+            False    # Don't show ETA
+        )
 
         # Show placeholder if no images are visible
         if not any(label.parent().isVisible() for label, _ in self.image_widgets):
-            self.placeholder_label.show()
-
-        # Set per-frame progress bar to 0% at end of render
-        self.frame_progress.setValue(0)
+            if hasattr(self, 'placeholder_widget'):
+                self.placeholder_widget.setParent(self.image_frame)
+                self.image_layout.addWidget(self.placeholder_widget)
+                self.placeholder_widget.show()
 
         # Shutdown logic - only trigger if render completed normally (not interrupted)
         if hasattr(self, 'shutdown_check') and self.shutdown_check.isChecked() and not self.canceling:
@@ -1959,6 +2218,10 @@ class HoudiniRenderGUI(QMainWindow):
             import threading
             delay_seconds = self.get_shutdown_delay_seconds()
             threading.Thread(target=self.schedule_shutdown, args=(delay_seconds,), daemon=True).start()
+
+        # Restart text update timers
+        self.summary_update_timer.start()
+        self.raw_update_timer.start()
 
     def get_shutdown_delay_seconds(self):
         text = self.shutdown_delay.currentText()
@@ -2045,8 +2308,10 @@ class HoudiniRenderGUI(QMainWindow):
 
     def update_progress_safe(self, current, total):
         """Update progress bars (called in main thread)"""
-        self.progress_frame.setMaximum(total)
-        self.progress_frame.setValue(current)
+        self.progress_frame.set_total_frames(total)
+
+        # Don't change the current frame progress here -
+        # that's updated separately by the block progress tracking
 
     def update_time_labels_safe(self, elapsed, average, est_total, remaining_time, eta_dt, show_eta):
         """Update time labels with render progress"""
@@ -2270,7 +2535,6 @@ class HoudiniRenderGUI(QMainWindow):
         days = timedelta.days
         hours, remainder = divmod(timedelta.seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-
         parts = []
         if days:
             parts.append(f"{days}d")
@@ -2568,7 +2832,20 @@ class HoudiniRenderGUI(QMainWindow):
             self.skip_check.setChecked(bool(settings['skip_rendered']))
 
     def append_output_safe(self, text, color=None, bold=False, center=False):
-        """Append text to output safely (called in main thread)"""
+        """Queue summary text updates to be processed in the main thread"""
+        with self.summary_update_lock:
+            self.summary_update_queue.append((text, color, bold, center))
+
+    def process_summary_updates(self):
+        """Process queued summary text updates in the main thread"""
+        updates = []
+        with self.summary_update_lock:
+            updates = self.summary_update_queue.copy()
+            self.summary_update_queue.clear()
+
+        if not updates:
+            return
+
         # Check if scrollbar is at the bottom before adding text
         scrollbar = self.summary_text.verticalScrollBar()
         at_bottom = scrollbar.value() == scrollbar.maximum()
@@ -2579,21 +2856,23 @@ class HoudiniRenderGUI(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.summary_text.setTextCursor(cursor)
 
-        # Format and insert new text
-        format = QTextCharFormat()
+        for text, color, bold, center in updates:
+            # Format and insert new text
+            format = QTextCharFormat()
 
-        if color:
-            format.setForeground(QColor(color))
-        if bold:
-            format.setFontWeight(QFont.Weight.Bold)
-        if center:
-            cursor.insertBlock()
-            blockFormat = QTextBlockFormat()
-            blockFormat.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cursor.setBlockFormat(blockFormat)
+            if color:
+                format.setForeground(QColor(color))
+            if bold:
+                format.setFontWeight(QFont.Weight.Bold)
+            if center:
+                cursor.insertBlock()
+                blockFormat = QTextBlockFormat()
+                blockFormat.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cursor.setBlockFormat(blockFormat)
 
-        cursor.insertText(text, format)
-        cursor.setBlockFormat(QTextBlockFormat())  # Reset block format to default (left-aligned)
+            cursor.insertText(text, format)
+            cursor.setBlockFormat(QTextBlockFormat())  # Reset block format to default (left-aligned)
+
         self.summary_text.setTextCursor(cursor)
 
         # Only scroll to bottom if we were already at the bottom
@@ -2601,17 +2880,34 @@ class HoudiniRenderGUI(QMainWindow):
             scrollbar.setValue(scrollbar.maximum())
 
     def append_raw_output_safe(self, text):
-        """Append text to raw output safely (called in main thread)"""
+        """Queue raw text updates to be processed in the main thread"""
+        with self.raw_update_lock:
+            self.raw_update_queue.append(text)
+
+    def process_raw_updates(self):
+        """Process queued raw text updates in the main thread"""
+        updates = []
+        with self.raw_update_lock:
+            updates = self.raw_update_queue.copy()
+            self.raw_update_queue.clear()
+
+        if not updates:
+            return
+
         # Check if scrollbar is at the bottom before adding text
         scrollbar = self.raw_text.verticalScrollBar()
         at_bottom = scrollbar.value() == scrollbar.maximum()
 
-        # Add the text at the end
+        # Clear any text selection and move cursor to end
         cursor = self.raw_text.textCursor()
         cursor.clearSelection()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.raw_text.setTextCursor(cursor)
-        cursor.insertText(text + '\n')  # Add newline after each line
+
+        for text in updates:
+            cursor.insertText(text + '\n')  # Add newline after each line
+
+        self.raw_text.setTextCursor(cursor)
 
         # Only scroll to bottom if we were already at the bottom
         if at_bottom:
@@ -2722,6 +3018,24 @@ class HoudiniRenderGUI(QMainWindow):
         print(f"Starting shutdown test with {delay_seconds} second delay")
         # Run the countdown in the main thread
         self.schedule_shutdown(delay_seconds)
+
+    def closeEvent(self, event):
+        """Handle window close event"""
+        # Stop text update timers
+        self.summary_update_timer.stop()
+        self.raw_update_timer.stop()
+
+        # Process any remaining text updates
+        self.process_summary_updates()
+        self.process_raw_updates()
+
+        # Clear text update queues
+        with self.summary_update_lock:
+            self.summary_update_queue.clear()
+        with self.raw_update_lock:
+            self.raw_update_queue.clear()
+
+        # ... rest of existing closeEvent code ...
 
 def get_houdini_history_file():
     """Get the path to the Houdini file.history"""
@@ -2949,6 +3263,8 @@ finally:
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon("icon.png"))
+
+    # Create main window
     window = HoudiniRenderGUI()
     window.show()
-    sys.exit(app.exec())  # Changed from app.exec_() to app.exec()
+    sys.exit(app.exec())

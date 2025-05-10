@@ -8,34 +8,47 @@ echo "Starting Hardeen - Houdini CLI/GUI Render Manager"
 echo "================================================="
 echo "Working directory: $(pwd)"
 
-# Check if virtual environment exists, create if not
-if [ ! -d "hardeen_env" ]; then
+# Name of the virtual environment directory
+VENV_DIR="hardeen_env"
+PYTHON_BIN="python3"
+
+# Check if Python is available
+if ! command -v $PYTHON_BIN &>/dev/null; then
+    echo "Error: $PYTHON_BIN is not installed or not in PATH."
+    exit 1
+fi
+
+# Create virtual environment if it doesn't exist
+if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv hardeen_env
+    $PYTHON_BIN -m venv "$VENV_DIR"
 fi
 
 # Activate the virtual environment
 echo "Activating virtual environment..."
-source hardeen_env/bin/activate
+source "$VENV_DIR/bin/activate"
 
-# Check and install dependencies
-echo "Checking dependencies..."
-# Redirect pip upgrade output to null and handle potential broken pipe
-python -m pip install --upgrade pip >/dev/null 2>&1 || true
+# Use venv's own Python path
+VENV_PY="$VENV_DIR/bin/python"
 
-# Install required packages if they're not already installed
-for package in PySide6 Pillow numpy openimageio requests
-do
-    if ! pip list 2>/dev/null | grep -q "$package"; then
+# Upgrade pip silently
+echo "Checking and upgrading pip..."
+$VENV_PY -m pip install --upgrade pip >/dev/null 2>&1 || true
+
+# List of required packages
+REQUIRED_PACKAGES=(PySide6 Pillow numpy openimageio requests)
+
+# Install missing packages
+for package in "${REQUIRED_PACKAGES[@]}"; do
+    if ! pip show "$package" >/dev/null 2>&1; then
         echo "Installing $package..."
-        # Handle pip install output more gracefully
         pip install "$package" 2>&1 | grep -v "WARNING:" || true
     fi
 done
 
-echo "Starting application..."
 # Launch the application
-python "$SCRIPT_DIR/hardeen.py"
+echo "Starting application..."
+$VENV_PY "$SCRIPT_DIR/hardeen.py"
 
 # Deactivate the virtual environment when done
 deactivate

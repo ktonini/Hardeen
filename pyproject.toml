@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hardeen"
+version = "0.1.0"
+description = "A modern Houdini render manager"
+readme = "README.md"
+authors = [
+    {name = "Keith Tonini", email = "keith@tonini.me"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "PySide6>=6.4.0",
+    "requests>=2.28.0",
+    "typing-extensions>=4.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.3.1",
+    "pytest-cov>=4.1.0",
+    "black>=23.3.0",
+    "isort>=5.12.0",
+    "mypy>=1.3.0",
+    "flake8>=6.0.0",
+    "build>=1.0.3",
+    "twine>=4.0.2",
+    "pyinstaller>=6.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/ktonini/hardeen"
+
+[project.scripts]
+hardeen = "hardeen.main:main"

@@ -1,67 +1,151 @@
-# Hardeen - Houdini CLI/GUI Render Manager
+# Hardeen - Houdini Render Manager
 
-Hardeen is a GUI and CLI tool for managing and monitoring Houdini renders, with a focus on Redshift renders.
+A modern, user-friendly render manager for Houdini that provides a graphical interface for managing and monitoring renders.
 
 ## Features
 
-- Intuitive GUI for setting up and monitoring renders
-- Support for rendering multiple ROPs via merge nodes
-- Frame range overrides
-- Skip already rendered frames option
-- Pushover notifications for render progress and completion
-- Image preview for rendered frames including EXR/AOV support
-- Shutdown computer after rendering
+- **Modern GUI**: Clean and intuitive interface built with PySide6
+- **Real-time Progress Visualization**: Live frame-by-frame status with visual indicators
+- **AOV/Layer Support**: View and navigate through EXR layers and AOVs
+- **Image Preview**: Real-time preview of rendered images
+- **Pushover Notifications**: Get notified when renders start, complete, or fail
+- **Frame Skipping**: Automatically skip already rendered frames
+- **Houdini Integration**: Seamless integration with Houdini's file history and node system
+- **Auto Shutdown**: Configure system shutdown after render completion
 
 ## Requirements
 
-- Python 3.6+
-- PySide6
-- Pillow (PIL)
-- NumPy
-- OpenImageIO
-- Houdini (hython must be in your PATH)
+- Python 3.8+
+- Houdini 18.0+
+- PySide6 6.4.0+
+- requests 2.28.0+
+- typing-extensions 4.5.0+
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/houdini_CLI_GUI.git
-cd houdini_CLI_GUI
+git clone https://github.com/yourusername/hardeen.git
+cd hardeen
 ```
 
-2. Run the launcher script:
+2. Install dependencies:
 ```bash
-./launch_hardeen.sh
+pip install .
 ```
 
-The launcher script will:
-- Create a virtual environment if it doesn't exist
-- Install all required dependencies
-- Launch the application
+3. (Optional) Set up Pushover notifications:
+   - Create a Pushover account at https://pushover.net
+   - Create an application to get your API token
+   - Enter your API token and user key in the settings window:
+     - Open Settings (gear icon)
+     - Navigate to "Notifications" tab
+     - Enter your Pushover API token and user key
 
 ## Usage
 
-### GUI Mode
+1. Run the application:
+```bash
+python -m hardeen
+```
 
-1. Select a Houdini (.hip) file
-2. Select an output node (ROP)
-3. Optionally override frame range
-4. Click "Render"
+2. Select a Houdini file:
+   - The app automatically finds and displays your recently opened Houdini (.hip) files in the dropdown
+   - Or browse to select a file
 
-### Batch Rendering
+3. Select an output node:
+   - The dropdown will show available ROP nodes
+   - Frame range will be automatically set from the node
 
-For batch rendering multiple ROPs:
-1. In Houdini, create a merge node and connect multiple ROPs to it
-2. In Hardeen, point to the merge node
-3. Each ROP will render with its own frame range
+4. Configure render settings:
+   - Adjust frame range if needed
+   - Enable/disable frame skipping option
+   - Configure notification settings
+   - Set up shutdown options if desired
+   - Click "Render" to begin
 
-### Shutdown after rendering
+5. Monitor progress:
+   - View frame-by-frame progress in the visualization
+   - Check estimated time remaining
+   - Preview rendered images and AOVs in real-time
+   - Receive notifications for:
+     - Render start
+     - Render completion
+     - Every N frames (configurable)
 
-Enable the "Shut down computer after render completes" option to automatically power off your computer when rendering is finished.
+## Development
 
-### Pushover Notifications
+### Project Structure
 
-To receive mobile notifications:
-1. Sign up for a Pushover account (https://pushover.net/)
-2. Enter your API key and user key in the notification settings
-3. Enable notifications and set the notification interval
+```
+hardeen/
+├── __init__.py
+├── __main__.py           # Package entry point
+├── main.py               # Main application logic
+├── config.py             # Configuration settings
+├── resources/            # Application resources
+│   └── icon.png          # Application icon
+├── gui/
+│   ├── __init__.py
+│   ├── main_window.py    # Main GUI window class
+│   ├── settings_dialog.py
+│   ├── settings_manager.py
+│   ├── notification_manager.py
+│   ├── ui_components.py  # Reusable UI components
+│   ├── widgets/          # Custom widgets
+│   ├── window_components/
+│   ├── managers/
+│   └── dialogs/
+├── core/
+│   ├── houdini.py        # Houdini-specific functionality
+│   ├── renderer.py       # Render process handling
+│   ├── render_manager.py # Manage multiple renders
+│   └── notifications.py  # Pushover notification handling
+└── utils/
+    ├── __init__.py
+    ├── time_utils.py     # Time formatting utilities
+    ├── settings.py       # Settings management
+    └── image_utils.py    # Image processing utilities
+```
+
+### Building from Source
+
+1. Install development dependencies:
+```bash
+pip install -e ".[dev]"
+```
+
+2. Run tests:
+```bash
+pytest
+```
+
+3. Build distribution packages:
+```bash
+python -m build
+```
+
+This will create distribution packages in the `dist/` directory:
+- `.tar.gz`: Source distribution
+- `.whl`: Wheel distribution (binary package)
+
+### Creating a Standalone Executable
+
+To create a standalone executable that users can run without installing Python:
+
+1. Install development dependencies as shown above, or install PyInstaller directly:
+```bash
+pip install pyinstaller
+```
+
+2. Create the executable:
+```bash
+pyinstaller --onefile --windowed --icon=hardeen/resources/icon.png --name=hardeen hardeen/__main__.py
+```
+
+This will create a standalone executable in the `dist/` directory.
+
+### TO DO
+- Web server UI for remote control
+- Drag and drop EXR layer inspection
+- Add EXR metadata to track cumulative render time across multiple start/stop cycles for accurate render time reporting
